@@ -14,6 +14,8 @@ from typing import Dict
 from services.pdf_parser import parse_pdf
 from agents.orchestrator import Orchestrator
 from services.excel_exporter import export_excel
+from settings import TMP_DIR
+os.makedirs(TMP_DIR, exist_ok=True)
 
 # 🔥 覆盖校验（已存在，不动）
 from services.coverage import (

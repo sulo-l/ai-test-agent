@@ -9,3 +9,4 @@ pypdf
 pdf2image
 pytesseract
 pillow
+python-dotenv
