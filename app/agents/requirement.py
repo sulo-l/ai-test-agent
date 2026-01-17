@@ -3,7 +3,7 @@
 # @Time: 2026/1/14 22:44
 # @Author: sulo
 
-from agents.base import BaseAgent
+from app.agents.base import BaseAgent
 
 
 class RequirementAgent(BaseAgent):

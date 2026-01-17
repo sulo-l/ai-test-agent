@@ -1,51 +1,33 @@
-# ===============================
-# Base image
-# ===============================
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-# ===============================
-# Python 环境变量（生产推荐）
-# ===============================
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+# ========== 基础环境 ==========
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    RUN_MODE=docker
 
-# ===============================
-# 系统依赖（PDF / OCR / 编译）
-# ===============================
+WORKDIR /app
+
+# ========== 系统依赖（PDF / 字体 / SSL） ==========
 RUN apt-get update && apt-get install -y \
     build-essential \
     poppler-utils \
+    fonts-noto-cjk \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ===============================
-# 工作目录
-# ===============================
-WORKDIR /app
-
-# ===============================
-# 安装 Python 依赖（先拷贝 requirements）
-# ===============================
+# ========== Python 依赖 ==========
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ===============================
-# 拷贝项目代码
-# ===============================
+# ========== 项目代码 ==========
 COPY . .
 
-# ===============================
-# 创建临时目录（与你的 TMP_DIR=/data/tmp 对应）
-# ===============================
-RUN mkdir -p /data/tmp
+# ========== 临时目录（⚠️ 关键） ==========
+# Docker 内允许写
+RUN mkdir -p /data/tmp && chmod -R 777 /data
 
-# ===============================
-# 暴露端口
-# ===============================
+# ========== 端口 ==========
 EXPOSE 8000
 
-# ===============================
-# 启动 FastAPI（生产模式）
-# ===============================
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# ========== 启动 ==========
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

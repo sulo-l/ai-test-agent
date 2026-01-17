@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Callable, Generator
-from llm.client import llm
-from services.coverage import (
+from app.llm.client import llm
+from app.services.coverage import (
     check_mandatory_coverage,
     calc_overall_status
 )

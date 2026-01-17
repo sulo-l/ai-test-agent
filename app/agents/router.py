@@ -4,7 +4,7 @@
 # @Author: sulo
 # agents/router.py
 
-from agents.llms import OpenAILLM, GeminiLLM
+from app.agents.llms import OpenAILLM, GeminiLLM
 
 
 class LLMRouter:

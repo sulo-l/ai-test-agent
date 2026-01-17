@@ -2,7 +2,7 @@ import json
 import re
 from typing import Any, Dict, List
 from openai import OpenAI
-from settings import config
+from app.settings import config
 
 
 def _extract_json_array(text: str) -> List[Dict[str, Any]]:

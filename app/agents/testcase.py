@@ -2,7 +2,7 @@
 # coding=utf-8
 # @Time: 2026/1/14 22:45
 # @Author: sulo
-from agents.base import BaseAgent
+from app.agents.base import BaseAgent
 
 class TestCaseAgent(BaseAgent):
     system_prompt = """

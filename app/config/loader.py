@@ -30,21 +30,20 @@ def _resolve_env(value):
 
 def load_config() -> dict:
     """
-    加载配置（支持 Docker / VPS）
+    加载配置（支持 Docker / VPS / 本地）
 
-    优先级：
-    1️⃣ config.yaml（支持 ${ENV_VAR}）
-    2️⃣ 环境变量真实注入
+    查找路径：
+    ai-test-agent/config.yaml
     """
 
-    # loader.py 在 ai-test-agent/config/loader.py
-    # parent = config/
-    # parent.parent = 项目根目录
-    project_root = Path(__file__).resolve().parent.parent
+    # loader.py → config → app → project_root
+    project_root = Path(__file__).resolve().parent.parent.parent
     config_path = project_root / "config.yaml"
 
     if not config_path.exists():
-        raise FileNotFoundError(f"Missing config.yaml at: {config_path}")
+        raise FileNotFoundError(
+            f"Missing config.yaml at: {config_path}"
+        )
 
     with open(config_path, "r", encoding="utf-8") as f:
         raw_cfg = yaml.safe_load(f) or {}
@@ -52,7 +51,9 @@ def load_config() -> dict:
     cfg = {}
     for k in ("base_url", "api_key", "model"):
         if k not in raw_cfg:
-            raise ValueError(f"config.yaml missing required field: {k}")
+            raise ValueError(
+                f"config.yaml missing required field: {k}"
+            )
 
         cfg[k] = _resolve_env(raw_cfg.get(k))
 

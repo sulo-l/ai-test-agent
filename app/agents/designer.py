@@ -2,7 +2,7 @@
 # coding=utf-8
 # @Time: 2026/1/13 20:07
 # @Author: sulo
-from agents.llms import GeminiLLM
+from app.agents.llms import GeminiLLM
 
 class TestDesigner:
     def __init__(self):

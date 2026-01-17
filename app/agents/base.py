@@ -5,7 +5,7 @@
 
 import json
 import re
-from llm.client import call_llm
+from app.llm.client import call_llm
 
 
 class BaseAgent:

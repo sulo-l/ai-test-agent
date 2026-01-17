@@ -1,8 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from agents.test_agent import TestAgent
-from agents.models import LLMRouter
+from app.agents.test_agent import TestAgent
+from app.agents.models import LLMRouter
 
 app = FastAPI(
     title="AI Test Agent",

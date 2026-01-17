@@ -11,20 +11,14 @@ import traceback
 import re
 from typing import Dict
 
-from services.pdf_parser import parse_pdf
-from agents.orchestrator import Orchestrator
-from services.excel_exporter import export_excel
-from settings import TMP_DIR
+# ✅ 统一从 app.settings 读取
+from app.settings import TMP_DIR
+
+# ✅ 初始化临时目录
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# 🔥 覆盖校验（已存在，不动）
-from services.coverage import (
-    check_mandatory_coverage,
-    calc_overall_status
-)
-
 # =====================================================
-# App 初始化（不动）
+# App 初始化
 # =====================================================
 app = FastAPI()
 
@@ -36,25 +30,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-orch = Orchestrator()
-TMP_DIR = "/tmp"
 TASK_EXCEL_MAP: Dict[str, str] = {}
 
 # =====================================================
-# UI / SSE 展示级清洗函数（✅ 新增）
+# UI 清洗函数
 # =====================================================
 def clean_case_name_for_ui(name: str) -> str:
-    """
-    UI 专用：去掉所有测试用例编号前缀
-    兼容：
-    - HA-Color-004:
-    - TP-UI-001-Normal:
-    - TC-STYLE-UI-001-01:
-    - TC-USA-002-03:
-    """
     if not name:
         return name
-
     return re.sub(
         r"^[A-Z]+(?:-[A-Z]+)*-\d+(?:-\d+)*:\s*",
         "",
@@ -62,33 +45,29 @@ def clean_case_name_for_ui(name: str) -> str:
     )
 
 
-
 def clean_module_name_for_ui(module: str) -> str:
-    """
-    UI 专用：去掉模块名英文括号
-    平均K线图 (Heikin Ashi) -> 平均K线图
-    """
     if not module:
         return module
-
     return module.split(" (")[0].strip()
 
 
 # =====================================================
-# 健康检查（不动）
+# 健康检查
 # =====================================================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 # =====================================================
-# SSE 工具函数（不动）
+# SSE 工具函数
 # =====================================================
 def sse_event(event_type: str, data):
     return f"data: {json.dumps({'type': event_type, 'data': data}, ensure_ascii=False)}\n\n"
 
+
 # =====================================================
-# SSE：流式生成（只增强，不破坏）
+# SSE 主接口
 # =====================================================
 @app.post("/generate-testcases/stream")
 async def generate_testcases_stream(
@@ -97,12 +76,21 @@ async def generate_testcases_stream(
 ):
     async def event_generator():
         task_id = str(uuid.uuid4())
-        os.makedirs(TMP_DIR, exist_ok=True)
-
         tmp_name = f"sse_{task_id}_{file.filename}"
         file_path = os.path.join(TMP_DIR, tmp_name)
 
         try:
+            # ✅ 全部使用 app.xxx 绝对路径
+            from app.services.pdf_parser import parse_pdf
+            from app.agents.orchestrator import Orchestrator
+            from app.services.excel_exporter import export_excel
+            from app.services.coverage import (
+                check_mandatory_coverage,
+                calc_overall_status
+            )
+
+            orch = Orchestrator()
+
             # ---------- connected ----------
             yield sse_event("connected", {"task_id": task_id})
 
@@ -139,7 +127,6 @@ async def generate_testcases_stream(
             # ---------- Stage 1：modules ----------
             modules = orch._stage_modules(raw_requirements)
 
-            # ✅ UI 清洗模块名
             modules_for_ui = []
             for m in modules:
                 m2 = dict(m)
@@ -156,13 +143,11 @@ async def generate_testcases_stream(
                 confirmed_items
             )
 
-            # 删除误生成模块（保持你原逻辑）
             test_points = [
                 m for m in test_points
                 if m.get("module") not in ("前端强制测试要求", "强制测试要求")
             ]
 
-            # ✅ UI 清洗 test_points 模块名
             test_points_for_ui = []
             for group in test_points:
                 g2 = dict(group)
@@ -172,7 +157,7 @@ async def generate_testcases_stream(
             yield sse_event("test_points", test_points_for_ui)
             await asyncio.sleep(0)
 
-            # ---------- 拍平测试点（coverage / Excel 用，不动） ----------
+            # ---------- coverage flatten ----------
             flat_test_points = []
             for group in test_points:
                 for p in group.get("points", []):
@@ -182,24 +167,19 @@ async def generate_testcases_stream(
                         "source_requirement": p.get("source_requirement")
                     })
 
-            # =====================================================
-            # Stage 3：cases（✅ UI 清洗）
-            # =====================================================
+            # ---------- Stage 3：cases ----------
             collected_cases = []
             index = 0
 
             for group in test_points:
-                module_test_points = [group]
-
                 for case in orch._stage_cases_stream(
                     raw_requirements,
-                    module_test_points,
+                    [group],
                     confirmed_items
                 ):
                     index += 1
                     collected_cases.append(case)
 
-                    # ✅ 只对 UI 返回的数据做清洗
                     case_for_ui = dict(case)
                     case_for_ui["case_name"] = clean_case_name_for_ui(
                         case_for_ui.get("case_name")
@@ -258,7 +238,7 @@ async def generate_testcases_stream(
 
 
 # =====================================================
-# Excel 下载接口（不动）
+# Excel 下载
 # =====================================================
 @app.get("/download/{task_id}")
 async def download_excel(task_id: str):

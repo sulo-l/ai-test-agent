@@ -4,7 +4,7 @@
 
 import json
 from openai import OpenAI
-from settings import get_settings
+from app.settings import get_settings
 
 
 class LLM:
