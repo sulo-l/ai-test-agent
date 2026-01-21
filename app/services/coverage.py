@@ -18,7 +18,10 @@ def calc_coverage(tp_id, cases):
 
     for case in cases:
         if case.get("test_point_id") == tp_id:
-            coverage_type = case.get("coverage")
+            coverage_type = (
+                case.get("coverage")
+                or case.get("coverage_type")
+            )
             if coverage_type in result:
                 result[coverage_type] = True
 
@@ -26,15 +29,16 @@ def calc_coverage(tp_id, cases):
 
 
 # ===============================
-# 🔥 新增：Mandatory Coverage 校验
+# 🔥 Mandatory / Focus Coverage 校验（升级版）
 # ===============================
 
 def check_mandatory_coverage(mandatory_items, test_points):
     """
-    校验用户指定的 mandatory coverage 是否被覆盖
+    校验用户指定的 mandatory / focus coverage 是否被覆盖
 
-    :param mandatory_items: list[str]
-        RequirementAgent 输出的 mandatory_coverage
+    :param mandatory_items: list[str] | None
+        - RequirementAgent 输出的 mandatory_coverage
+        - 或用户 focus_requirements 拆解后的项
     :param test_points: list[dict]
         TestPointAgent 生成的测试点
     :return: dict[str, bool]
@@ -45,17 +49,31 @@ def check_mandatory_coverage(mandatory_items, test_points):
     """
     result = {}
 
+    if not mandatory_items:
+        return result
+
     for item in mandatory_items:
         covered = False
 
         for tp in test_points:
-            # 方式 1：明确绑定（最可靠）
-            if tp.get("source_requirement") == item:
-                covered = True
-                break
+            # =========================
+            # 方式 1：新体系（最高优先）
+            # =========================
+            if tp.get("origin") == "mandatory":
+                # 如果 source_requirement 明确匹配
+                if tp.get("source_requirement") == item:
+                    covered = True
+                    break
 
-            # 方式 2：兜底文本匹配（防 LLM 偶尔漏字段）
-            if item in (tp.get("name") or ""):
+                # 兜底：名称语义匹配
+                if item and item in (tp.get("name") or ""):
+                    covered = True
+                    break
+
+            # =========================
+            # 方式 2：旧体系兼容
+            # =========================
+            if tp.get("source_requirement") == item:
                 covered = True
                 break
 
@@ -65,12 +83,12 @@ def check_mandatory_coverage(mandatory_items, test_points):
 
 
 # ===============================
-# 🔥 新增：整体完成状态计算
+# 🔥 整体完成状态计算（增强版）
 # ===============================
 
 def calc_overall_status(mandatory_coverage_result):
     """
-    根据 mandatory coverage 结果计算整体状态
+    根据 mandatory / focus coverage 结果计算整体状态
 
     :return:
         - "Completed"
@@ -83,3 +101,41 @@ def calc_overall_status(mandatory_coverage_result):
         return "Completed"
 
     return "Partially Covered"
+
+
+# ===============================
+# ⭐ 可选：Focus 命中统计（不影响现有逻辑）
+# ===============================
+
+def calc_focus_hit_cases(cases):
+    """
+    统计重点（mandatory / focus）测试用例命中数量
+
+    :param cases: list[dict]
+        TestCaseAgent / Orchestrator 输出的用例
+    :return: dict
+        {
+          "focus_cases": int,
+          "total_cases": int,
+          "focus_ratio": float
+        }
+    """
+    if not cases:
+        return {
+            "focus_cases": 0,
+            "total_cases": 0,
+            "focus_ratio": 0.0,
+        }
+
+    total = len(cases)
+    focus_cases = sum(
+        1 for c in cases
+        if c.get("origin") == "mandatory"
+        or c.get("coverage_item")
+    )
+
+    return {
+        "focus_cases": focus_cases,
+        "total_cases": total,
+        "focus_ratio": round(focus_cases / total, 3) if total else 0.0,
+    }

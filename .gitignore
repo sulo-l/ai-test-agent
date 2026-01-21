@@ -10,3 +10,6 @@ venv/
 # ===== OS =====
 .DS_Store
 .idea/
+
+# ===== Temp Files =====
+tmp/

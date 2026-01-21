@@ -1,13 +1,18 @@
 #! /usr/bin/python3
 # coding=utf-8
+# @Author: sulo
 
 from datetime import datetime
 import re
+import os
+from typing import List, Dict, Any
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
 
+from app.settings import TMP_DIR
+
 # ===============================
-# Excel 表头
+# Excel 表头（保持不动）
 # ===============================
 HEADERS = [
     "用例名称", "所属模块", "标签", "前置条件", "步骤描述",
@@ -22,6 +27,8 @@ EXCEL_CELL_LIMIT = 32000
 # 工具函数
 # ===============================
 def _truncate(text: str) -> str:
+    if not text:
+        return ""
     if len(text) > EXCEL_CELL_LIMIT:
         return text[:EXCEL_CELL_LIMIT] + "\n【内容过长，已截断】"
     return text
@@ -36,18 +43,9 @@ def _cell(v):
 
 
 # ===============================
-# 🔥 新增：steps 终极归一化（本次核心修复）
+# 🔥 steps 归一化（保持不动）
 # ===============================
-def _normalize_steps(steps) -> list[str]:
-    """
-    将 steps 统一为 List[str]
-    支持：
-    - str
-    - List[str]
-    - List[{"step": "..."}]
-    - List[{"desc": "..."}]
-    - 混合结构
-    """
+def _normalize_steps(steps) -> List[str]:
     if not steps:
         return []
 
@@ -55,7 +53,6 @@ def _normalize_steps(steps) -> list[str]:
         return [s.strip() for s in steps.split("\n") if s.strip()]
 
     normalized = []
-
     for s in steps:
         if isinstance(s, str):
             normalized.append(s.strip())
@@ -74,38 +71,26 @@ def _normalize_steps(steps) -> list[str]:
     return [x for x in normalized if x]
 
 
+# =====================================================
+# 用例名 / 模块清洗（保持不动）
+# =====================================================
 def clean_case_name(name: str) -> str:
-    """
-    Excel 专用：终极兜底清洗用例名称前缀
-    """
     if not name:
         return name
 
     name = name.strip()
-
-    # ① 冒号型前缀
     name = re.sub(r"^[A-Za-z0-9_-]+:\s*", "", name)
-
-    # ② 找到第一个中文字符
-    m = re.search(r"[\u4e00-\u9fff]", name)
-    if m:
-        name = name[m.start():]
-
     return name.strip()
 
 
 def clean_module_name(module: str) -> str:
-    """
-    去掉模块名中的英文括号说明
-    """
     if not module:
         return module
-
     return module.split(" (")[0].strip()
 
 
 # ===============================
-# 🔥 展开 case
+# Case 结构处理
 # ===============================
 def flatten_cases(raw_cases: list) -> list:
     result = []
@@ -123,11 +108,23 @@ def flatten_cases(raw_cases: list) -> list:
     return result
 
 
-# ===============================
-# ⭐ Case 标准化
-# ===============================
-def normalize_case(raw: dict) -> dict:
-    # ✅ 核心修复：steps 彻底归一
+def infer_priority(steps, is_focus: bool = False):
+    if is_focus:
+        return "P0"
+
+    text = " ".join(steps)
+    if any(k in text for k in ["资金", "下单", "风控"]):
+        return "P0"
+    if "异常" in text:
+        return "P1"
+    return "P2"
+
+
+def infer_automatable(steps):
+    return "是" if any("接口" in s for s in steps) else "否"
+
+
+def normalize_case(raw: Dict[str, Any]) -> Dict[str, Any]:
     steps = _normalize_steps(raw.get("steps"))
 
     expected = (
@@ -154,38 +151,34 @@ def normalize_case(raw: dict) -> dict:
         or f"【{raw.get('type','')}】{raw.get('test_point_name','未命名用例')}"
     )
 
-    case_name = clean_case_name(case_name)
-    module = clean_module_name(raw.get("module", ""))
+    is_focus = raw.get("origin") == "mandatory"
+    coverage_item = raw.get("coverage_item")
+
+    tags = ["功能测试"]
+    if is_focus:
+        tags.append("重点测试")
+
+    remark = ""
+    if coverage_item:
+        remark = f"重点覆盖：{coverage_item}"
 
     return {
-        "case_name": case_name,
-        "module": module,
-        "tags": "功能测试",
+        "case_name": clean_case_name(case_name),
+        "module": clean_module_name(raw.get("module", "")),
+        "tags": ",".join(tags),
         "precondition": precondition,
         "steps": steps,
         "expected": expected,
-        "priority": infer_priority(steps),
+        "priority": infer_priority(steps, is_focus=is_focus),
         "automatable": infer_automatable(steps),
+        "remark": remark,
     }
 
 
-def infer_priority(steps):
-    text = " ".join(steps)
-    if any(k in text for k in ["资金", "下单", "风控"]):
-        return "P0"
-    if "异常" in text:
-        return "P1"
-    return "P2"
-
-
-def infer_automatable(steps):
-    return "是" if any("接口" in s for s in steps) else "否"
-
-
 # ===============================
-# ⭐ Excel 导出
+# ⭐ 原始导出逻辑（增强重点可见性）
 # ===============================
-def export_excel(raw_cases: list):
+def export_excel(raw_cases: list, save_path: str) -> str:
     wb = Workbook()
     ws = wb.active
     ws.title = "测试用例"
@@ -208,7 +201,7 @@ def export_excel(raw_cases: list):
             _cell(c["steps"]),
             _cell(c["expected"]),
             "STEP",
-            "",
+            _cell(c["remark"]),
             "未开始",
             "",
             c["priority"],
@@ -219,13 +212,26 @@ def export_excel(raw_cases: list):
         row = ws.max_row
         ws[f"E{row}"].alignment = wrap
         ws[f"F{row}"].alignment = wrap
+        ws[f"H{row}"].alignment = wrap
 
     ws.column_dimensions["A"].width = 40
     ws.column_dimensions["B"].width = 30
     ws.column_dimensions["D"].width = 35
     ws.column_dimensions["E"].width = 70
     ws.column_dimensions["F"].width = 60
+    ws.column_dimensions["H"].width = 40
 
-    filename = f"测试用例_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    wb.save(filename)
-    return filename
+    wb.save(save_path)
+    return save_path
+
+
+# =====================================================
+# ✅ Workflow / Router 唯一依赖入口（保持不动）
+# =====================================================
+def export_cases_to_excel(
+    cases: List[Dict[str, Any]],
+    workflow_id: str,
+) -> str:
+    os.makedirs(TMP_DIR, exist_ok=True)
+    save_path = os.path.join(TMP_DIR, f"{workflow_id}.xlsx")
+    return export_excel(cases, save_path)

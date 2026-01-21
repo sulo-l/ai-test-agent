@@ -1,6 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from app.workflow.router import router as workflow_router
+
 
 import shutil
 import os
@@ -9,18 +11,25 @@ import json
 import asyncio
 import traceback
 import re
-from typing import Dict
+from typing import Dict, Optional
 
-# ✅ 统一从 app.settings 读取
+# ===============================
+# 项目内部依赖
+# ===============================
 from app.settings import TMP_DIR
+from app.workflow.state import update_workflow, get_workflow
+from app.workflow.models import WorkflowStage
 
-# ✅ 初始化临时目录
+# ✅ 正确的 merge 函数
+from app.workflow.merge import merge_generation_context
+
+# ===============================
+# 初始化
+# ===============================
 os.makedirs(TMP_DIR, exist_ok=True)
 
-# =====================================================
-# App 初始化
-# =====================================================
 app = FastAPI()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,34 +39,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ⭐ 注册 workflow 路由（关键）
+from app.workflow.router import router as workflow_router
+app.include_router(workflow_router, prefix="/workflow", tags=["workflow"])
+
 TASK_EXCEL_MAP: Dict[str, str] = {}
-
-# =====================================================
-# UI 清洗函数
-# =====================================================
-def clean_case_name_for_ui(name: str) -> str:
-    if not name:
-        return name
-    return re.sub(
-        r"^[A-Z]+(?:-[A-Z]+)*-\d+(?:-\d+)*:\s*",
-        "",
-        name
-    )
-
-
-def clean_module_name_for_ui(module: str) -> str:
-    if not module:
-        return module
-    return module.split(" (")[0].strip()
-
-
-# =====================================================
-# 健康检查
-# =====================================================
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
 
 # =====================================================
 # SSE 工具函数
@@ -67,12 +53,13 @@ def sse_event(event_type: str, data):
 
 
 # =====================================================
-# SSE 主接口
+# SSE 主接口（生成阶段）
 # =====================================================
 @app.post("/generate-testcases/stream")
 async def generate_testcases_stream(
     file: UploadFile = File(...),
-    requirement: str = Form("")
+    requirement: str = Form(""),
+    workflow_id: Optional[str] = Form(None),
 ):
     async def event_generator():
         task_id = str(uuid.uuid4())
@@ -80,147 +67,123 @@ async def generate_testcases_stream(
         file_path = os.path.join(TMP_DIR, tmp_name)
 
         try:
-            # ✅ 全部使用 app.xxx 绝对路径
             from app.services.pdf_parser import parse_pdf
             from app.agents.orchestrator import Orchestrator
             from app.services.excel_exporter import export_excel
-            from app.services.coverage import (
-                check_mandatory_coverage,
-                calc_overall_status
-            )
 
             orch = Orchestrator()
 
-            # ---------- connected ----------
+            # ===============================
+            # workflow：开始生成
+            # ===============================
+            if workflow_id:
+                update_workflow(
+                    workflow_id,
+                    stage=WorkflowStage.GENERATING,
+                    progress=5,
+                    message="建立生成任务",
+                    task_id=task_id,
+                )
+
             yield sse_event("connected", {"task_id": task_id})
 
-            # ---------- 保存 PDF ----------
+            # ===============================
+            # 保存 PDF
+            # ===============================
             with open(file_path, "wb") as f:
                 shutil.copyfileobj(file.file, f)
 
-            # ---------- PDF 解析 ----------
+            # ===============================
+            # PDF 解析
+            # ===============================
             yield sse_event("stage", "pdf_parsing")
+            update_workflow(workflow_id, progress=15, message="解析需求文档")
 
             pdf_data = parse_pdf(file_path) or {}
-            confirmed_text = pdf_data.get("confirmed_text", "")
-            ocr_text = pdf_data.get("ocr_text", "")
+            raw_requirements = (
+                pdf_data.get("confirmed_text", "")
+                + "\n"
+                + pdf_data.get("ocr_text", "")
+            ).strip()
 
-            raw_requirements = confirmed_text
-            if ocr_text:
-                raw_requirements += "\n\n【OCR 补充内容】\n" + ocr_text
-
-            yield sse_event("pdf_parsed", {
-                "confirmed_text": confirmed_text,
-                "ocr_text": ocr_text,
-                "confidence": pdf_data.get("confidence", "LOW"),
-            })
-
-            if not raw_requirements.strip():
+            if not raw_requirements:
                 yield sse_event("error", {"message": "PDF 无有效文本"})
                 return
 
-            # ---------- agent_running ----------
-            yield sse_event("stage", "agent_running")
+            # =====================================================
+            # ⭐ 关键：合并「分析结果 + 用户输入 + 原始需求」
+            # =====================================================
+            analysis_result = None
+            if workflow_id:
+                wf = get_workflow(workflow_id)
+                analysis_result = wf.analysis_result if wf else None
 
-            confirmed_items = [requirement] if requirement else []
-
-            # ---------- Stage 1：modules ----------
-            modules = orch._stage_modules(raw_requirements)
-
-            modules_for_ui = []
-            for m in modules:
-                m2 = dict(m)
-                m2["module"] = clean_module_name_for_ui(m2.get("module"))
-                modules_for_ui.append(m2)
-
-            yield sse_event("modules", modules_for_ui)
-            await asyncio.sleep(0)
-
-            # ---------- Stage 2：test_points ----------
-            test_points = orch._stage_test_points(
-                raw_requirements,
-                modules,
-                confirmed_items
+            merged = merge_generation_context(
+                raw_requirements=raw_requirements,
+                user_requirement=requirement,
+                analysis_result=analysis_result,
             )
 
-            test_points = [
-                m for m in test_points
-                if m.get("module") not in ("前端强制测试要求", "强制测试要求")
-            ]
+            merged_context = merged["merged_requirements"]
 
-            test_points_for_ui = []
-            for group in test_points:
-                g2 = dict(group)
-                g2["module"] = clean_module_name_for_ui(g2.get("module"))
-                test_points_for_ui.append(g2)
+            # ===============================
+            # Stage 1：modules
+            # ===============================
+            update_workflow(workflow_id, progress=30, message="构建功能模块")
+            modules = orch._stage_modules(merged_context)
+            yield sse_event("modules", modules)
 
-            yield sse_event("test_points", test_points_for_ui)
-            await asyncio.sleep(0)
+            # ===============================
+            # Stage 2：test_points
+            # ===============================
+            update_workflow(workflow_id, progress=50, message="生成测试点")
+            test_points = orch._stage_test_points(
+                merged_context,
+                modules,
+                [],
+            )
+            yield sse_event("test_points", test_points)
 
-            # ---------- coverage flatten ----------
-            flat_test_points = []
-            for group in test_points:
-                for p in group.get("points", []):
-                    flat_test_points.append({
-                        "id": p.get("id"),
-                        "name": p.get("name"),
-                        "source_requirement": p.get("source_requirement")
-                    })
-
-            # ---------- Stage 3：cases ----------
+            # ===============================
+            # Stage 3：cases
+            # ===============================
+            update_workflow(workflow_id, progress=70, message="生成测试用例")
             collected_cases = []
-            index = 0
 
             for group in test_points:
                 for case in orch._stage_cases_stream(
-                    raw_requirements,
+                    merged_context,
                     [group],
-                    confirmed_items
+                    [],
                 ):
-                    index += 1
                     collected_cases.append(case)
-
-                    case_for_ui = dict(case)
-                    case_for_ui["case_name"] = clean_case_name_for_ui(
-                        case_for_ui.get("case_name")
-                    )
-                    case_for_ui["module"] = clean_module_name_for_ui(
-                        case_for_ui.get("module")
-                    )
-
-                    yield sse_event("case", {
-                        "case": case_for_ui,
-                        "index": index
-                    })
-
+                    yield sse_event("case", {"case": case})
                     await asyncio.sleep(0)
 
-            # ---------- Coverage ----------
-            coverage_result = check_mandatory_coverage(
-                confirmed_items,
-                flat_test_points
-            )
-            status = calc_overall_status(coverage_result)
-
-            # ---------- Excel ----------
-            yield sse_event("stage", "excel_export")
-
+            # ===============================
+            # Excel
+            # ===============================
+            update_workflow(workflow_id, progress=90, message="导出 Excel")
             excel_path = export_excel(collected_cases)
             TASK_EXCEL_MAP[task_id] = excel_path
 
-            # ---------- done ----------
+            update_workflow(
+                workflow_id,
+                stage=WorkflowStage.GENERATED,
+                progress=100,
+                message="生成完成",
+                excel_path=excel_path,
+            )
+
             yield sse_event("done", {
-                "total": len(collected_cases),
                 "task_id": task_id,
                 "download_url": f"/download/{task_id}",
-                "status": status,
-                "coverage": coverage_result
             })
 
         except Exception as e:
             yield sse_event("error", {
                 "message": str(e),
-                "trace": traceback.format_exc()
+                "trace": traceback.format_exc(),
             })
 
         finally:
@@ -233,7 +196,7 @@ async def generate_testcases_stream(
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-        }
+        },
     )
 
 
@@ -243,13 +206,8 @@ async def generate_testcases_stream(
 @app.get("/download/{task_id}")
 async def download_excel(task_id: str):
     excel_path = TASK_EXCEL_MAP.get(task_id)
-
     if not excel_path or not os.path.exists(excel_path):
-        return JSONResponse(
-            status_code=404,
-            content={"message": "Excel 文件不存在或已过期"}
-        )
-
+        return JSONResponse(status_code=404, content={"message": "Excel 不存在"})
     return FileResponse(
         excel_path,
         filename="智能体生成测试用例.xlsx",
