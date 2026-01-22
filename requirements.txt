@@ -10,3 +10,4 @@ pdf2image
 pytesseract
 pillow
 python-dotenv
+openai==1.6.1
