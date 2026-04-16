@@ -6,116 +6,125 @@ from typing import List, Optional, Dict, Any
 
 
 # =====================================================
-# 权重配置（后续可调 / 可配置化）
+# 权重配置（仅用于优先级描述，不参与内容拼接）
 # =====================================================
 DEFAULT_WEIGHTS = {
-    "focus_requirements": 1.2,   # ⭐ 用户明确指定的测试重点（最高优先级）
-    "user_requirement": 1.0,     # 用户补充需求
-    "ai_suggestion": 0.8,        # AI 分析建议
-    "raw_requirement": 0.4,      # 原始需求文本（兜底）
+    "focus_requirements": 1.2,   # 用户明确指定的测试重点
+    "user_requirement": 1.0,     # 用户补充说明（测试视角）
+    "ai_suggestion": 0.8,        # AI 分析建议（风险 / 覆盖）
 }
 
 
-# =====================================================
-# 核心：合并生成上下文
-# =====================================================
 def merge_generation_context(
     *,
     raw_requirements: str,
     user_requirement: Optional[str] = None,
-    focus_requirements: Optional[str] = None,   # ⭐ 新增
+    focus_requirements: Optional[str] = None,
     analysis_result: Optional[Dict[str, Any]] = None,
     weights: Dict[str, float] = DEFAULT_WEIGHTS,
 ) -> Dict[str, Any]:
     """
-    将【测试重点 + 用户需求 + AI 分析结果 + 原始需求】合并，
-    生成测试用例生成阶段的统一输入上下文。
+    ⚠️【生成阶段工程级硬约束】
 
-    返回：
-        {
-            "merged_requirements": str,
-            "priority_items": List[str],
-            "meta": {...}
-        }
+    本函数用于【测试点 / 测试用例生成阶段】上下文合并：
+
+    ✅ 允许：
+    - 覆盖策略
+    - 测试视角
+    - 风险提示
+    - 覆盖缺口
+
+    ❌ 严禁：
+    - raw_requirements 原文进入生成阶段
+    - 引入 PDF 中不存在的新功能描述
     """
 
     merged_blocks: List[str] = []
     priority_items: List[str] = []
 
     # =================================================
-    # 0️⃣ 用户明确指定的测试重点（最高优先级）
+    # 0️⃣ 用户明确指定的【测试覆盖重点】（最高优先级）
     # =================================================
     if focus_requirements:
         merged_blocks.append(
-            f"""【用户指定测试重点｜权重 {weights['focus_requirements']}｜最高优先级】
+            f"""【测试覆盖重点（最高优先级）】
 {focus_requirements.strip()}
 
-⚠️ 要求：
-- 以下测试用例必须明显偏向上述重点
-- 不允许只覆盖 happy path
+⚠️ 强制约束：
+- 仅用于指导测试覆盖方式（异常 / 边界 / 组合 / 顺序）
+- 不视为新增需求
+- 不允许引入 PDF 中不存在的功能
 """
         )
         priority_items.append("focus_requirements")
 
     # =================================================
-    # 1️⃣ 用户手写 requirement
+    # 1️⃣ 用户补充说明（测试视角，不是需求）
     # =================================================
     if user_requirement:
         merged_blocks.append(
-            f"""【用户补充测试要求｜权重 {weights['user_requirement']}】
-{user_requirement.strip()}"""
+            f"""【用户补充测试说明】
+{user_requirement.strip()}
+
+⚠️ 说明：
+- 仅用于补充测试思路 / 关注点
+- 不等同于需求变更
+"""
         )
         priority_items.append("user_requirement")
 
     # =================================================
-    # 2️⃣ AI 分析建议
+    # 2️⃣ AI 分析结果（⚠️ 只允许“风险 / 建议 / 覆盖缺口”）
     # =================================================
     if analysis_result:
-        suggestions = analysis_result.get("suggestions") or []
-        issues = analysis_result.get("issues") or []
         risks = analysis_result.get("risks") or []
-
-        if suggestions:
-            merged_blocks.append(
-                f"""【AI 测试建议｜权重 {weights['ai_suggestion']}】
-""" + "\n".join(f"- {s}" for s in suggestions)
-            )
-            priority_items.append("ai_suggestions")
-
-        if issues:
-            merged_blocks.append(
-                """【AI 识别的需求缺陷】
-""" + "\n".join(f"- {i}" for i in issues)
-            )
+        issues = analysis_result.get("issues") or []
+        suggestions = analysis_result.get("suggestions") or []
 
         if risks:
             merged_blocks.append(
-                """【AI 识别的风险点】
-""" + "\n".join(f"- {r}" for r in risks)
+                "【AI 识别的测试风险（仅供覆盖参考）】\n"
+                + "\n".join(f"- {r}" for r in risks)
+                + "\n⚠️ 不允许据此新增业务功能，仅用于补充测试场景"
             )
 
-    # =================================================
-    # 3️⃣ 原始需求文本（兜底）
-    # =================================================
-    if raw_requirements:
-        merged_blocks.append(
-            f"""【原始需求文档｜权重 {weights['raw_requirement']}】
-{raw_requirements.strip()}"""
-        )
-        priority_items.append("raw_requirement")
+        if issues:
+            merged_blocks.append(
+                "【AI 识别的覆盖缺口 / 需求问题】\n"
+                + "\n".join(f"- {i}" for i in issues)
+            )
+
+        if suggestions:
+            merged_blocks.append(
+                "【AI 给出的测试建议】\n"
+                + "\n".join(f"- {s}" for s in suggestions)
+            )
+
+        priority_items.append("ai_analysis")
 
     # =================================================
-    # 4️⃣ 合并结果
+    # ❌ 3️⃣ 原始需求文本（raw_requirements）
     # =================================================
-    merged_text = "\n\n".join(merged_blocks)
+    # ⚠️ 明确禁止：
+    # - raw_requirements 只能用于 A 分支分析
+    # - 在 B 分支生成阶段绝不拼接
+    # - 不允许模型基于全文“自由理解需求”
+
+    merged_text = "\n\n".join(merged_blocks).strip()
 
     return {
+        # ⚠️ 注意命名：这是“生成上下文”，不是“需求原文”
         "merged_requirements": merged_text,
+
+        # 仅用于调试 / 解释优先级
         "priority_items": priority_items,
+
+        # 明确的工程元信息（防误用）
         "meta": {
-            "weights": weights,
             "has_focus_requirements": bool(focus_requirements),
             "has_user_requirement": bool(user_requirement),
-            "has_analysis": bool(analysis_result),
+            "has_analysis_result": bool(analysis_result),
+            "raw_requirement_used": False,   # ⭐ 工程级声明
+            "generation_scope": "coverage_strategy_only",
         },
     }

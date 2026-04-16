@@ -5,11 +5,7 @@ from app.config.loader import load_config
 # =====================================================
 # ① 显式加载 .env（⚠️ 非常关键）
 # =====================================================
-# 会从当前工作目录向上查找 .env
-# - 本地开发
-# - Docker --env-file
-# - VPS 手动 export
-# 都能覆盖
+# 加载 .env 文件到环境变量中
 load_dotenv()
 
 # =====================================================
@@ -28,6 +24,7 @@ def get_settings() -> dict:
     global _CONFIG
     if _CONFIG is None:
         try:
+            # 从 config.yaml 或其他配置源加载配置
             _CONFIG = load_config() or {}
         except Exception:
             # ⚠️ 允许 config.yaml 缺失（Docker / 本地 mock）
@@ -36,11 +33,11 @@ def get_settings() -> dict:
 
 
 # =====================================================
-# ③ 统一读取入口（唯一可信入口）
+# ③ 统一读取配置（唯一可信入口）
 # =====================================================
 def _get_env_or_config(key: str, default=None):
     """
-    优先级：
+    获取配置项的值，优先级：
     ENV > config.yaml > default
     """
     return os.getenv(key, get_settings().get(key, default))
@@ -86,6 +83,12 @@ FRONTEND_ORIGIN = _get_env_or_config("FRONTEND_ORIGIN", "*")
 OPENAI_API_KEY = _get_env_or_config("OPENAI_API_KEY")
 OPENAI_BASE_URL = _get_env_or_config("OPENAI_BASE_URL")
 OPENAI_MODEL = _get_env_or_config("OPENAI_MODEL")
+
+# ========= 测试用例生成配置 =========
+# 最大生成用例数（测试环境可设为5，生产环境设为200）
+MAX_TESTCASES = int(_get_env_or_config("MAX_TESTCASES", 200))
+# 每个测试点最多生成几条用例（测试环境可设为1，生产环境设为3）
+MAX_CASES_PER_POINT = int(_get_env_or_config("MAX_CASES_PER_POINT", 3))
 
 # ========= 基础校验（早失败，别拖到 runtime） =========
 if not OPENAI_API_KEY:

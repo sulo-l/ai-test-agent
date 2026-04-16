@@ -1,78 +1,142 @@
-#! /usr/bin/python3
-# coding=utf-8
-# @Time: 2026/1/15 00:21
-# @Author: sulo
-# services/confirmed_extractor.py
+# -*- coding: utf-8 -*-
+"""
+Confirmed Extractor
+===================
+职责：
+- 从 PDF/文本中抽取【高置信、可锚定的信息】
+- 从前端补充中抽取【用户明确指定的重点测试方向】
+- 输出规范化结果结构，便于用于后续 Prompt 或智能分析
+- ❌ 不调用 LLM
+- ❌ 不做语义推理
+"""
 
 import re
 from typing import List, Dict, Any, Optional
 
 
-def _extract_focus_points(requirement: Optional[str]) -> List[str]:
+# =====================================================
+# 内部工具：解析前端重点测试方向
+# =====================================================
+def _extract_focus_points(requirement: Optional[str]) -> List[Dict[str, str]]:
     """
-    从前端补充的 requirement 中拆解【重点测试方向】
+    将前端补充的 requirement（用户重点测试方向）
+    拆解为结构化列表。
+
+    输入可能包含多个句子或用符号分隔的要点。
     """
     if not requirement:
         return []
 
-    # 常见中文分隔符
+    # 用逗号、分号、换行符等符号分割
     parts = re.split(r"[，,；;、\n]", requirement)
 
-    focus_points = []
+    results: List[Dict[str, str]] = []
+
     for p in parts:
         p = p.strip()
-        if len(p) >= 2:
-            focus_points.append(p)
+        if not p:
+            continue
+        if len(p) < 2:
+            continue
 
-    return focus_points
+        results.append({
+            "text": p,
+            "source": "user_focus",  # 标记：来自用户重点补充
+        })
+
+    return results
 
 
+# =====================================================
+# 主入口
+# =====================================================
 def extract_confirmed_items(
-    text: str,
-    requirement: Optional[str] = None
+        text: str,
+        requirement: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    从 OCR / 文本中抽取【确定识别】的高置信内容
-    同时解析前端指定的【重点测试方向】
+    从需求原始文本中抽取“高置信”的实体/行为片段，
+    同时合并前端指定的重点测试方向。
 
-    返回结构化结果，供下游 Agent 使用
+    返回结构：
+    {
+        "confirmed_items": [
+            {"type": "xxx", "value": "yyy"}
+        ],
+        "focus_points": [
+            {"text": "...", "source": "user_focus"}
+        ],
+        "prompt_hint": str,
+        "has_focus": bool
+    }
     """
 
-    # ===============================
-    # 1️⃣ 原有：PDF 高置信内容抽取（完全保留）
-    # ===============================
-    confirmed = set()
+    confirmed: List[Dict[str, str]] = []
 
     if text:
+        # 常用能够高置信提取的模式
         patterns = [
-            r"https?://[^\s]+",                 # URL
-            r"/api/[a-zA-Z0-9/_\-]+",            # API 路径
-            r"登录|注册|退出|新增|删除|修改|查询",
-            r"用户|账号|用户名|密码|验证码|权限|角色",
-            r"成功|失败|错误|异常|超时",
+            ("url", r"https?://[^\s]+"),
+            ("api", r"/api/[a-zA-Z0-9/_\-]+"),
+            ("action", r"登录|注册|退出|新增|删除|修改|查询"),
+            ("entity", r"用户|账号|用户名|密码|验证码|权限|角色"),
+            ("status", r"成功|失败|错误|异常|超时"),
         ]
 
-        for p in patterns:
-            for m in re.findall(p, text):
-                confirmed.add(m.strip())
+        seen = set()
 
-    confirmed_items = sorted(list(confirmed))
+        for item_type, pattern in patterns:
+            for m in re.findall(pattern, text):
+                key = f"{item_type}:{m}"
+                if key in seen:
+                    continue
+                seen.add(key)
 
-    # ===============================
-    # 2️⃣ 新增：前端重点测试方向解析
-    # ===============================
+                confirmed.append({
+                    "type": item_type,
+                    "value": m.strip(),
+                })
+
+    # ================
+    # 前端重点测试方向（最高优先级）
+    # ================
     focus_points = _extract_focus_points(requirement)
 
-    # ===============================
-    # 3️⃣ 返回统一结构（关键）
-    # ===============================
-    return {
-        # PDF / OCR 中“客观存在”的内容
-        "confirmed_items": confirmed_items,
+    # ================
+    # 生成 Prompt Hint 提示片段
+    # ================
+    prompt_lines: List[str] = []
 
-        # 前端显式要求的重点测试方向（最高优先级）
+    if focus_points:
+        prompt_lines.append("【用户明确要求重点关注的测试方向】")
+        for fp in focus_points:
+            prompt_lines.append(f"- {fp['text']}")
+
+    if confirmed:
+        # 仅当存在高置信抽取内容时添加
+        prompt_lines.append("\n【从需求文本中识别到的客观实体/行为】")
+        for c in confirmed:
+            prompt_lines.append(f"- ({c['type']}) {c['value']}")
+
+    # 如果既没用户 focus，又没抽取出高置信实体
+    if not prompt_lines:
+        prompt_hint = (
+            "未从需求文本中识别到明确的高置信实体，"
+            "请基于整体需求文本思考测试设计方向。"
+        )
+    else:
+        prompt_hint = "\n".join(prompt_lines)
+
+    return {
+        # 抽取到的高置信信息
+        "confirmed_items": confirmed,
+
+        # 用户主动指定的重点测试方向
         "focus_points": focus_points,
 
-        # 方便后续 prompt 直接拼接
-        "has_focus": len(focus_points) > 0,
+        # 是否存在用户 • 重点关注方向
+        "has_focus": bool(focus_points),
+
+        # 可直接插入 Prompt 的文案片段
+        "prompt_hint": prompt_hint,
     }
