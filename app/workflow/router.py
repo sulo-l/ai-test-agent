@@ -1,6 +1,7 @@
 #! /usr/bin/python3
 # coding=utf-8
-# app/workflow/router.py
+# @Author: sulo
+# @Desc: Workflow Router (基础工作流创建/上传/状态更新)
 
 from fastapi import (
     APIRouter,
@@ -9,335 +10,275 @@ from fastapi import (
     File,
     Form,
 )
-from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
-from typing import Optional, Generator
-import uuid
 import os
 import shutil
-import json
+import logging
 import time
-import queue
-import threading
-import traceback
+import asyncio
+from typing import Any, Dict
 
-from app.workflow.models import WorkflowStage
+# ===============================
+# Workflow State（内存态）
+# ===============================
 from app.workflow.state import (
     create_workflow,
     get_workflow,
-    update_workflow,
     update_workflow_stage,
+    update_workflow_data,
     reset_workflow,
-    get_workflow_progress,
 )
-from app.workflow.analyze import analyze_requirements
-from app.services.pdf_parser import parse_pdf
-from app.services.excel_exporter import export_cases_to_excel
-from app.agents.orchestrator import Orchestrator
+from app.workflow.models import WorkflowStage
 from app.settings import TMP_DIR
 
-router = APIRouter(tags=["workflow"])
-os.makedirs(TMP_DIR, exist_ok=True)
+# ===============================
+# PDF 解析（只在 upload 阶段）
+# ===============================
+from app.services.requirement_preparer import prepare_requirement_from_pdf
 
-DONE = object()
+# ✅ 改成统一 requirement store
+from app.services.requirement_store import upsert_requirement
+
+# =====================================================
+# Router
+# =====================================================
+router = APIRouter(prefix="/workflow", tags=["Workflow"])
+os.makedirs(TMP_DIR, exist_ok=True)
+logger = logging.getLogger(__name__)
+
+DEFAULT_REQUIREMENT_ID = os.getenv("TC_DEFAULT_REQUIREMENT_ID", "default-requirement-id")
 
 
 # =====================================================
 # Models
 # =====================================================
-
-class WorkflowCreateResponse(BaseModel):
-    workflow_id: str
-    stage: str
-
-
-class WorkflowStatusResponse(BaseModel):
-    workflow_id: str
-    stage: str
-    progress: int
-    message: Optional[str] = None
-    excel_path: Optional[str] = None
-    total_cases: Optional[int] = None
-
-
-class WorkflowAnalyzeRequest(BaseModel):
+class WorkflowIdRequest(BaseModel):
     workflow_id: str
 
 
-class WorkflowAnalyzeResponse(BaseModel):
-    summary: dict
-    requirements: list
-    issues: list
-    risks: list
-    suggestions: list
+class PrepareGenerateRequest(BaseModel):
+    workflow_id: str
+    focus_requirements: str | None = None
 
 
 # =====================================================
-# SSE helpers
+# 工具函数
 # =====================================================
-
-def sse_pack(event: str, data: dict) -> str:
-    # ✅ ensure_ascii=False 保证中文不被转义
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def _safe_text(v: Any) -> str:
+    return str(v or "").strip()
 
 
-def sse_ping() -> str:
-    return ": ping\n\n"
+def _prepared_to_dict(prepared: Any) -> Dict[str, Any]:
+    """
+    把 PreparedRequirement / 任意 prepared 对象转成可序列化 dict
+    """
+    if prepared is None:
+        return {}
+
+    if isinstance(prepared, dict):
+        return dict(prepared)
+
+    result: Dict[str, Any] = {}
+
+    for attr in (
+        "requirement_id",
+        "final_text",
+        "total_pages",
+        "usable_for_ai",
+        "pages",
+        "requirement_blocks",
+        "source_file_name",
+        "title",
+    ):
+        try:
+            value = getattr(prepared, attr, None)
+            if value is not None:
+                result[attr] = value
+        except Exception:
+            continue
+
+    return result
 
 
 # =====================================================
 # 1️⃣ 创建 workflow
 # =====================================================
-@router.post("/create", response_model=WorkflowCreateResponse)
+@router.post("/create")
 def create_new_workflow():
-    workflow_id = str(uuid.uuid4())
-    create_workflow(workflow_id=workflow_id)
-    update_workflow_stage(workflow_id, WorkflowStage.IDLE)
-
-    return WorkflowCreateResponse(
-        workflow_id=workflow_id,
-        stage=WorkflowStage.IDLE.value,
-    )
-
-
-# =====================================================
-# 2️⃣ 查询 workflow 状态
-# =====================================================
-@router.get("/status/{workflow_id}", response_model=WorkflowStatusResponse)
-def get_workflow_status(workflow_id: str):
-    task = get_workflow(workflow_id)
-    if not task:
-        raise HTTPException(404, "Workflow not found")
-
-    progress = get_workflow_progress(workflow_id)
-    if not progress:
-        raise HTTPException(404, "Workflow progress not found")
-
-    return WorkflowStatusResponse(
-        workflow_id=workflow_id,
-        stage=progress.stage,
-        progress=progress.progress,
-        message=progress.message,
-        excel_path=task.excel_path,
-        total_cases=task.total_cases,
-    )
-
-
-# =====================================================
-# 3️⃣ 上传 PDF
-# =====================================================
-@router.post("/upload-pdf")
-def upload_pdf(
-    workflow_id: str = Form(...),
-    file: UploadFile = File(...),
-):
-    task = get_workflow(workflow_id)
-    if not task:
-        raise HTTPException(404, "Workflow not found")
-
-    file_path = os.path.join(TMP_DIR, f"{workflow_id}_{file.filename}")
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    pdf_data = parse_pdf(file_path)
-    raw_text = (
-        (pdf_data.get("confirmed_text") or "")
-        + "\n"
-        + (pdf_data.get("ocr_text") or "")
-    ).strip()
-
-    if not raw_text:
-        raise HTTPException(400, "PDF 解析失败")
-
-    update_workflow(
-        workflow_id=workflow_id,
-        pdf_path=file_path,
-        pdf_text=raw_text,
-    )
-    update_workflow_stage(workflow_id, WorkflowStage.FILE_READY)
-
+    task = create_workflow()
     return {
-        "workflow_id": workflow_id,
-        "filename": file.filename,
-        "text_length": len(raw_text),
+        "success": True,
+        "data": {
+            "workflow_id": task.workflow_id,
+            "stage": task.stage.value,
+        },
     }
 
 
 # =====================================================
-# 4️⃣ AI 需求分析
+# ♻️ 重置 workflow
 # =====================================================
-@router.post("/analyze", response_model=WorkflowAnalyzeResponse)
-def analyze_workflow(req: WorkflowAnalyzeRequest):
+@router.post("/reset")
+def reset_workflow_status(req: WorkflowIdRequest):
     task = get_workflow(req.workflow_id)
     if not task:
-        raise HTTPException(404, "Workflow not found")
+        task = create_workflow(workflow_id=req.workflow_id)
 
-    if not task.pdf_text:
-        raise HTTPException(400, "PDF 尚未上传")
-
-    update_workflow_stage(req.workflow_id, WorkflowStage.ANALYZING)
-
-    try:
-        result = analyze_requirements(
-            workflow_id=req.workflow_id,
-            raw_requirements=task.pdf_text,
-        )
-    except Exception as e:
-        update_workflow_stage(
-            req.workflow_id,
-            WorkflowStage.ERROR,
-            message=str(e),
-        )
-        raise HTTPException(500, "AI 需求分析失败")
-
-    update_workflow(
-        workflow_id=req.workflow_id,
-        analysis_result=result,
-    )
-    update_workflow_stage(req.workflow_id, WorkflowStage.ANALYSIS_DONE)
-
-    return WorkflowAnalyzeResponse(**result)
-
-
-# =====================================================
-# 5️⃣ AI 测试用例生成（SSE · 工程级稳定版）
-# =====================================================
-@router.get("/generate/stream")
-def generate_testcases_stream(
-    workflow_id: str,
-    requirement: str = "",
-):
-    task = get_workflow(workflow_id)
-    if not task:
-        raise HTTPException(404, "Workflow not found")
-
-    if not task.pdf_text:
-        raise HTTPException(400, "PDF 尚未上传")
-
-    q: "queue.Queue" = queue.Queue()
-
-    def worker():
-        try:
-            update_workflow_stage(workflow_id, WorkflowStage.GENERATING)
-
-            q.put(("meta", {"message": "generation_started"}))
-
-            # 没有测试点则补生成（保留你原逻辑）
-            if not task.test_points:
-                analyze_requirements(
-                    workflow_id=workflow_id,
-                    raw_requirements=task.pdf_text,
-                )
-
-            refreshed = get_workflow(workflow_id)
-            if not refreshed or not refreshed.test_points:
-                raise RuntimeError("未生成测试点")
-
-            orch = Orchestrator()
-            collected = []
-
-            # ⭐ 从 workflow 里拿到 focus_requirements（即使为空也不影响）
-            focus_requirements = getattr(refreshed, "focus_requirements", None)
-
-            for case in orch.run_streaming(
-                raw_requirements=refreshed.pdf_text,
-                test_points=refreshed.test_points,
-                confirmed_items=[],
-                requirement_hint=requirement,
-                analysis_result=refreshed.analysis_result,
-                focus_requirements=focus_requirements,  # ⭐ 透传给生成阶段
-            ):
-                collected.append(case)
-                q.put(("case", case))
-
-            excel_path = export_cases_to_excel(collected, workflow_id)
-            update_workflow(
-                workflow_id=workflow_id,
-                excel_path=excel_path,
-                total_cases=len(collected),
-            )
-            update_workflow_stage(workflow_id, WorkflowStage.GENERATED)
-
-            q.put((
-                "done",
-                {
-                    "total": len(collected),
-                    "download_url": f"/workflow/download/{workflow_id}",
-                },
-            ))
-
-        except Exception as e:
-            traceback.print_exc()
-            update_workflow_stage(
-                workflow_id,
-                WorkflowStage.ERROR,
-                message=str(e),
-            )
-            q.put(("error", {"message": str(e)}))
-        finally:
-            q.put(DONE)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-    def event_stream() -> Generator[str, None, None]:
-        # ⭐ 首包，立刻防止前端超时
-        yield sse_pack("meta", {"message": "connected"})
-
-        last_send = time.time()
-
-        while True:
-            try:
-                item = q.get(timeout=0.5)
-                if item is DONE:
-                    break
-
-                event, payload = item
-                yield sse_pack(event, payload)
-                last_send = time.time()
-
-            except queue.Empty:
-                # 心跳保活
-                if time.time() - last_send > 10:
-                    yield sse_ping()
-                    last_send = time.time()
-
-    return StreamingResponse(
-        event_stream(),
-        # ✅ 关键：明确 charset，避免 EventStream 中文乱码
-        media_type="text/event-stream; charset=utf-8",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            # ✅ 双保险：某些代理/中间层会覆盖 media_type
-            "Content-Type": "text/event-stream; charset=utf-8",
-        },
-    )
-
-
-# =====================================================
-# 6️⃣ 下载 Excel
-# =====================================================
-@router.get("/download/{workflow_id}")
-def download_excel(workflow_id: str):
-    task = get_workflow(workflow_id)
-    if task and task.excel_path and os.path.exists(task.excel_path):
-        return FileResponse(
-            task.excel_path,
-            filename=os.path.basename(task.excel_path),
-        )
-    raise HTTPException(404, "Excel 不存在")
-
-
-# =====================================================
-# 7️⃣ 重置 workflow
-# =====================================================
-@router.post("/reset/{workflow_id}")
-def reset_workflow_api(workflow_id: str):
-    task = reset_workflow(workflow_id)
-    if not task:
-        raise HTTPException(404, "Workflow not found")
+    reset_workflow(req.workflow_id)
 
     return {
-        "workflow_id": task.workflow_id,
-        "stage": task.stage.value,
+        "success": True,
+        "data": {
+            "workflow_id": req.workflow_id,
+            "stage": WorkflowStage.IDLE.value,
+        },
     }
+
+
+# =====================================================
+# 2️⃣ 上传 PDF（唯一允许构造 PreparedRequirement 的地方）
+# =====================================================
+@router.post("/upload-pdf")
+async def upload_pdf(
+    workflow_id: str = Form(...),
+    file: UploadFile = File(...),
+    requirement_id: str | None = Form(None),
+):
+    """
+    上传 PDF 并解析出需求文本：
+    - 写入 workflow 内存对象（供 API 同进程读）
+    - ✅ 同时统一持久化到 requirement_store（供 ARQ worker 读）
+    """
+    task = get_workflow(workflow_id)
+    if not task:
+        logger.warning("[upload_pdf] workflow_id=%s not found, auto-creating", workflow_id)
+        task = create_workflow(workflow_id=workflow_id)
+
+    rid = (requirement_id or "").strip() or DEFAULT_REQUIREMENT_ID
+
+    # 1) 保存上传 PDF 到临时目录
+    file_path = os.path.join(TMP_DIR, f"{workflow_id}_{file.filename}")
+    try:
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        logger.exception("Save uploaded PDF failed: %s", e)
+        raise HTTPException(status_code=500, detail="Save uploaded PDF failed")
+
+    # 2) 解析 PDF（在线程池中运行，避免阻塞 asyncio 事件循环）
+    try:
+        def _parse_pdf():
+            try:
+                return prepare_requirement_from_pdf(
+                    pdf_path=file_path,
+                    requirement_id=rid,
+                )
+            except TypeError:
+                try:
+                    return prepare_requirement_from_pdf(
+                        file_path,
+                        requirement_id=rid,
+                    )
+                except TypeError:
+                    return prepare_requirement_from_pdf(file_path)
+
+        parsed = await asyncio.to_thread(_parse_pdf)
+
+        pdf_text = _safe_text(getattr(parsed, "final_text", ""))
+        total_pages = int(getattr(parsed, "total_pages", 0) or 0)
+        usable_for_ai = bool(getattr(parsed, "usable_for_ai", bool(pdf_text)))
+        source_file_name = _safe_text(getattr(parsed, "source_file_name", "")) or _safe_text(file.filename)
+    except Exception as e:
+        logger.exception("PDF parse failed: %s", e)
+        raise HTTPException(status_code=500, detail="PDF parse failed")
+
+    if not pdf_text:
+        raise HTTPException(status_code=400, detail="Parsed PDF text is empty")
+
+    prepared_dict = _prepared_to_dict(parsed)
+
+    # 3) 写入 workflow 内存数据（保留 + 补强）
+    update_workflow_data(
+        workflow_id=workflow_id,
+        pdf_path=file_path,
+        pdf_text=pdf_text,
+        requirement_id=rid,
+        prepared_requirement=prepared_dict,
+        source_file_name=source_file_name,
+        updated_at=int(time.time()),
+    )
+
+    # 4) ✅ 统一持久化到 requirement_store（worker 可直接读）
+    try:
+        await upsert_requirement(
+            workflow_id=workflow_id,
+            requirement_id=rid,
+            requirement_text=pdf_text,
+            pdf_path=file_path,
+            source_file_name=source_file_name,
+            extra={
+                "source": "workflow.upload_pdf",
+                "file_name": _safe_text(file.filename),
+                "total_pages": total_pages,
+                "usable_for_ai": usable_for_ai,
+            },
+        )
+    except Exception as e:
+        logger.exception("Persist requirement failed: %s", e)
+        raise HTTPException(status_code=500, detail="Persist requirement failed")
+
+    # 5) 修改状态为 PDF 已就绪
+    update_workflow_stage(workflow_id, WorkflowStage.FILE_READY)
+
+    logger.info(
+        "[workflow.upload_pdf] success | workflow_id=%s | requirement_id=%s | text_len=%s | pdf_path=%s | source_file_name=%s | total_pages=%s | usable_for_ai=%s",
+        workflow_id,
+        rid,
+        len(pdf_text),
+        file_path,
+        source_file_name,
+        total_pages,
+        usable_for_ai,
+    )
+
+    return {
+        "success": True,
+        "data": {
+            "workflow_id": workflow_id,
+            "stage": WorkflowStage.FILE_READY.value,
+            "requirement_id": rid,
+            "text_length": len(pdf_text),
+            "pdf_path": file_path,
+            "source_file_name": source_file_name,
+            "total_pages": total_pages,
+            "usable_for_ai": usable_for_ai,
+        },
+    }
+
+
+# =====================================================
+# 3️⃣ 保存补充生成要求
+# =====================================================
+@router.post("/prepare-generate")
+def prepare_generate(req: PrepareGenerateRequest):
+    task = get_workflow(req.workflow_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    update_workflow_data(
+        workflow_id=req.workflow_id,
+        focus_requirements=req.focus_requirements,
+        updated_at=int(time.time()),
+    )
+
+    return {"success": True}
+
+
+# =====================================================
+# ❗ 以下接口已弃用
+# =====================================================
+# 不再提供 /workflow/analyze/stream
+# 不再提供 /workflow/generate/stream
+
+
+
